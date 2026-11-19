@@ -4,12 +4,15 @@ import { z } from 'zod'
 import AdminUser from '../models/AdminUser.js'
 import AboutContent from '../models/AboutContent.js'
 import RefreshSession from '../models/RefreshSession.js'
+import { getCloudinary, isCloudinaryConfigured } from '../config/cloudinary.js'
 import { asyncHandler } from '../utils/asyncHandler.js'
 import { writeAuditLog } from '../utils/audit.js'
+import { destroyManagedAsset } from '../utils/cloudinaryMedia.js'
 import {
   clearAdminCookies,
   issueAdminSession,
   requireAdmin,
+  requireChangedPassword,
   revokeRefreshCookie,
   rotateAdminSession,
 } from '../middleware/auth.js'
@@ -23,6 +26,26 @@ const passwordSchema = z.object({
   currentPassword: z.string().min(1).max(200),
   newPassword: z.string().min(12).max(200),
 })
+const avatarFormats = 'jpg,jpeg,png,webp,avif'
+const avatarMimeTypes = ['image/jpeg', 'image/png', 'image/webp', 'image/avif']
+const avatarMaxBytes = 5 * 1024 * 1024
+const avatarSignatureSchema = z.object({
+  mimeType: z.string().min(1).max(100),
+  bytes: z.number().int().positive(),
+})
+const avatarCompleteSchema = z.object({
+  publicId: z.string().min(1).max(240),
+})
+
+function serializeAdmin(admin) {
+  return {
+    id: String(admin._id),
+    name: admin.name,
+    email: admin.email,
+    avatarUrl: admin.avatarUrl || null,
+    mustChangePassword: admin.mustChangePassword,
+  }
+}
 
 router.post('/login', asyncHandler(async (req, res) => {
   const result = loginSchema.safeParse(req.body)
@@ -64,12 +87,7 @@ router.post('/login', asyncHandler(async (req, res) => {
 
   return res.json({
     success: true,
-    data: {
-      id: String(admin._id),
-      name: admin.name,
-      email: admin.email,
-      mustChangePassword: admin.mustChangePassword,
-    },
+    data: serializeAdmin(admin),
   })
 }))
 
@@ -82,12 +100,7 @@ router.post('/refresh', asyncHandler(async (req, res) => {
 
   return res.json({
     success: true,
-    data: {
-      id: String(admin._id),
-      name: admin.name,
-      email: admin.email,
-      mustChangePassword: admin.mustChangePassword,
-    },
+    data: serializeAdmin(admin),
   })
 }))
 
@@ -104,12 +117,103 @@ router.post('/logout', requireAdmin, asyncHandler(async (req, res) => {
 
 router.get('/me', requireAdmin, (req, res) => res.json({
   success: true,
-  data: {
-    id: String(req.admin._id),
-    name: req.admin.name,
-    email: req.admin.email,
-    mustChangePassword: req.admin.mustChangePassword,
-  },
+  data: serializeAdmin(req.admin),
+}))
+
+router.post('/avatar/signature', requireAdmin, requireChangedPassword, asyncHandler(async (req, res) => {
+  const parsed = avatarSignatureSchema.safeParse(req.body)
+  if (!parsed.success || !avatarMimeTypes.includes(parsed.data?.mimeType) || parsed.data.bytes > avatarMaxBytes) {
+    return res.status(400).json({
+      success: false,
+      message: 'Choose a JPEG, PNG, WebP or AVIF profile image no larger than 5 MB.',
+    })
+  }
+  if (!isCloudinaryConfigured()) {
+    return res.status(503).json({ success: false, message: 'Media storage is not configured.' })
+  }
+
+  const folder = `marvex-energy/admin-avatars/${req.admin._id}`
+  const timestamp = Math.floor(Date.now() / 1000)
+  const signature = getCloudinary().utils.api_sign_request(
+    { timestamp, folder, allowed_formats: avatarFormats },
+    process.env.CLOUDINARY_API_SECRET,
+  )
+
+  return res.json({
+    success: true,
+    data: {
+      cloudName: process.env.CLOUDINARY_CLOUD_NAME,
+      apiKey: process.env.CLOUDINARY_API_KEY,
+      timestamp,
+      signature,
+      folder,
+      allowedFormats: avatarFormats,
+      resourceType: 'image',
+    },
+  })
+}))
+
+router.post('/avatar/complete', requireAdmin, requireChangedPassword, asyncHandler(async (req, res) => {
+  const parsed = avatarCompleteSchema.safeParse(req.body)
+  if (!parsed.success) {
+    return res.status(400).json({ success: false, message: 'Invalid profile image details.' })
+  }
+  if (!isCloudinaryConfigured()) {
+    return res.status(503).json({ success: false, message: 'Media storage is not configured.' })
+  }
+
+  const folder = `marvex-energy/admin-avatars/${req.admin._id}`
+  const resource = await getCloudinary().api.resource(parsed.data.publicId, { resource_type: 'image' })
+  const resourcePublicId = typeof resource.public_id === 'string' ? resource.public_id : ''
+  const resourceFolder = resource.asset_folder || resource.folder || ''
+  const belongsToAdmin = resourcePublicId.startsWith(`${folder}/`)
+    && (resourceFolder === folder || resourceFolder.startsWith(`${folder}/`))
+  if (!belongsToAdmin) {
+    return res.status(400).json({ success: false, message: 'Uploaded profile image is not in your profile folder.' })
+  }
+
+  if (
+    resource.resource_type !== 'image' ||
+    !avatarFormats.split(',').includes(String(resource.format).toLowerCase()) ||
+    !resource.secure_url ||
+    !Number.isInteger(resource.bytes) ||
+    resource.bytes < 1 ||
+    resource.bytes > avatarMaxBytes
+  ) {
+    await destroyManagedAsset(resourcePublicId, 'image')
+    return res.status(400).json({ success: false, message: 'Uploaded profile image failed validation.' })
+  }
+
+  const previousPublicId = req.admin.avatarPublicId
+  req.admin.avatarUrl = resource.secure_url
+  req.admin.avatarPublicId = resourcePublicId
+  await req.admin.save()
+  await writeAuditLog(req, 'admin.avatar_updated', 'Administrator profile photo was updated.', 'admin', req.admin._id)
+
+  let warning
+  if (previousPublicId && previousPublicId !== resourcePublicId) {
+    try {
+      await destroyManagedAsset(previousPublicId, 'image')
+    } catch (cleanupError) {
+      console.error('CMS profile image cleanup failed:', cleanupError.message)
+      warning = 'Profile photo changed, but the previous photo could not be removed.'
+    }
+  }
+
+  return res.json({ success: true, data: serializeAdmin(req.admin), ...(warning ? { warning } : {}) })
+}))
+
+router.delete('/avatar', requireAdmin, requireChangedPassword, asyncHandler(async (req, res) => {
+  if (!req.admin.avatarPublicId && !req.admin.avatarUrl) {
+    return res.json({ success: true, data: serializeAdmin(req.admin) })
+  }
+
+  if (req.admin.avatarPublicId) await destroyManagedAsset(req.admin.avatarPublicId, 'image')
+  req.admin.avatarUrl = null
+  req.admin.avatarPublicId = null
+  await req.admin.save()
+  await writeAuditLog(req, 'admin.avatar_deleted', 'Administrator profile photo was deleted.', 'admin', req.admin._id)
+  return res.json({ success: true, data: serializeAdmin(req.admin) })
 }))
 
 router.post('/change-password', requireAdmin, asyncHandler(async (req, res) => {
