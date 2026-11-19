@@ -4,7 +4,9 @@ import cookieParser from 'cookie-parser'
 import express from 'express'
 import rateLimit from 'express-rate-limit'
 import helmet from 'helmet'
+
 import { verifyTrustedOrigin } from './middleware/auth.js'
+
 import aboutRoutes from './routes/aboutRoutes.js'
 import activityRoutes from './routes/activityRoutes.js'
 import authRoutes from './routes/authRoutes.js'
@@ -12,11 +14,11 @@ import carouselRoutes from './routes/carouselRoutes.js'
 import dashboardRoutes from './routes/dashboardRoutes.js'
 import galleryRoutes from './routes/galleryRoutes.js'
 import mediaRoutes from './routes/mediaRoutes.js'
+
 import HttpError from './utils/HttpError.js'
 
 const app = express()
 
-// Allowed frontend domains
 const frontendOrigins = [
   'https://www.marvexenergy.com',
   'https://marvexenergy.com',
@@ -26,35 +28,53 @@ const frontendOrigins = [
     .filter(Boolean),
 ]
 
-// Remove duplicate origins
 const allowedOrigins = [...new Set(frontendOrigins)]
 
-app.set('trust proxy', process.env.TRUST_PROXY === '1' ? 1 : false)
+app.set('trust proxy', 1)
 app.disable('x-powered-by')
 
 app.use(helmet())
 
-// CORS configuration
-const corsOptions = {
-  credentials: true,
-  methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization'],
+app.use(cors({
   origin(origin, callback) {
-    if (!origin || allowedOrigins.includes(origin.replace(/\/+$/, ''))) {
+    if (!origin) {
+      return callback(null, true)
+    }
+
+    const normalizedOrigin = origin.replace(/\/+$/, '')
+
+    if (allowedOrigins.includes(normalizedOrigin)) {
       return callback(null, true)
     }
 
     console.error('CORS blocked origin:', origin)
-    return callback(new HttpError(403, 'This origin is not allowed.'))
-  },
-}
 
-app.use(cors(corsOptions))
+    return callback(
+      new HttpError(403, 'This origin is not allowed.'),
+    )
+  },
+
+  credentials: true,
+
+  methods: [
+    'GET',
+    'POST',
+    'PUT',
+    'PATCH',
+    'DELETE',
+    'OPTIONS',
+  ],
+
+  allowedHeaders: [
+    'Content-Type',
+    'Authorization',
+  ],
+}))
 
 app.use(express.json({ limit: '1mb' }))
 app.use(cookieParser())
 
-// Security middleware
+// Validate trusted origins for state-changing requests.
 app.use(verifyTrustedOrigin)
 
 const loginLimiter = rateLimit({
@@ -62,22 +82,32 @@ const loginLimiter = rateLimit({
   limit: 8,
   standardHeaders: 'draft-8',
   legacyHeaders: false,
-  handler: (_req, res) => res.status(429).json({
-    success: false,
-    message: 'Too many sign-in attempts. Try again in 15 minutes.',
-  }),
+
+  handler: (_req, res) => {
+    res.status(429).json({
+      success: false,
+      message: 'Too many sign-in attempts. Try again in 15 minutes.',
+    })
+  },
 })
 
 app.get('/health', (_req, res) => {
-  res.json({ success: true, status: 'ok' })
+  res.json({
+    success: true,
+    status: 'ok',
+  })
 })
 
 app.use(
   '/api/cms/auth',
-  (req, res, next) => (
-    req.path === '/login' ? loginLimiter(req, res, next) : next()
-  ),
-  authRoutes
+  (req, res, next) => {
+    if (req.path === '/login') {
+      return loginLimiter(req, res, next)
+    }
+
+    return next()
+  },
+  authRoutes,
 )
 
 app.use('/api/cms', aboutRoutes)
@@ -87,7 +117,6 @@ app.use('/api/cms/carousels', carouselRoutes)
 app.use('/api/cms/gallery', galleryRoutes)
 app.use('/api/cms', mediaRoutes)
 
-// 404 handler
 app.use((_req, res) => {
   res.status(404).json({
     success: false,
@@ -95,12 +124,18 @@ app.use((_req, res) => {
   })
 })
 
-// Global error handler
 app.use((error, _req, res, _next) => {
   let status = error instanceof HttpError ? error.status : 500
 
   if (error.code === 11000) status = 409
-  if (error.name === 'ValidationError' || error.name === 'CastError') status = 400
+
+  if (
+    error.name === 'ValidationError' ||
+    error.name === 'CastError'
+  ) {
+    status = 400
+  }
+
   if (error.type === 'entity.parse.failed') status = 400
   if (error.type === 'entity.too.large') status = 413
 
@@ -112,13 +147,11 @@ app.use((error, _req, res, _next) => {
     })
   }
 
-  const message = status >= 500
-    ? 'An unexpected server error occurred.'
-    : error.message
-
   return res.status(status).json({
     success: false,
-    message,
+    message: status >= 500
+      ? 'An unexpected server error occurred.'
+      : error.message,
   })
 })
 
