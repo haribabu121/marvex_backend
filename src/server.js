@@ -2,6 +2,7 @@ import 'dotenv/config'
 import app from './app.js'
 import { connectDatabase } from './config/db.js'
 import { seedAboutContent, seedAdminAccount } from './routes/authRoutes.js'
+import { startSuryaGharCleanupWorker } from './utils/suryaGharCleanupWorker.js'
 
 const port = Number.parseInt(process.env.PORT || '4000', 10)
 
@@ -36,6 +37,7 @@ async function start() {
   await connectDatabase()
   await seedAdminAccount()
   await seedAboutContent()
+  startSuryaGharCleanupWorker()
 
   app.listen(port, () => {
     console.log(`CMS API listening on port ${port}.`)

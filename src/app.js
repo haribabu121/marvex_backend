@@ -12,8 +12,11 @@ import activityRoutes from './routes/activityRoutes.js'
 import authRoutes from './routes/authRoutes.js'
 import carouselRoutes from './routes/carouselRoutes.js'
 import dashboardRoutes from './routes/dashboardRoutes.js'
+import employeeAuthRoutes from './routes/employeeAuthRoutes.js'
+import employeeRoutes from './routes/employeeRoutes.js'
 import galleryRoutes from './routes/galleryRoutes.js'
 import mediaRoutes from './routes/mediaRoutes.js'
+import suryaGharRoutes from './routes/suryaGharRoutes.js'
 
 import HttpError from './utils/HttpError.js'
 
@@ -110,9 +113,20 @@ app.use(
   authRoutes,
 )
 
+app.use(
+  '/api/cms/employee-auth',
+  (req, res, next) => {
+    if (req.path === '/login') return loginLimiter(req, res, next)
+    return next()
+  },
+  employeeAuthRoutes,
+)
+
 app.use('/api/cms', aboutRoutes)
 app.use('/api/cms/dashboard', dashboardRoutes)
 app.use('/api/cms/activity-logs', activityRoutes)
+app.use('/api/cms/employees', employeeRoutes)
+app.use('/api/cms/surya-ghar', suryaGharRoutes)
 app.use('/api/cms/carousels', carouselRoutes)
 app.use('/api/cms/gallery', galleryRoutes)
 app.use('/api/cms', mediaRoutes)
