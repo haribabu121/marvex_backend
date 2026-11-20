@@ -71,7 +71,7 @@ router.put('/about', requireAdmin, requireChangedPassword, asyncHandler(async (r
         })),
       },
     },
-    { new: true, runValidators: true },
+    { returnDocument: 'after', runValidators: true },
   )
 
   await writeAuditLog(req, 'about.updated', 'About page performance content was updated.', 'about', content._id)

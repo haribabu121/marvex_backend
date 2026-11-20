@@ -19,7 +19,7 @@ export function setEmployeeCookie(res, employee) {
   res.cookie(EMPLOYEE_COOKIE, token, {
     httpOnly: true,
     secure: production,
-    sameSite: production ? 'none' : 'lax',
+    sameSite: 'lax',
     path: '/api/cms',
     maxAge: 8 * 60 * 60 * 1000,
   })
@@ -30,7 +30,7 @@ export function clearEmployeeCookie(res) {
   res.clearCookie(EMPLOYEE_COOKIE, {
     httpOnly: true,
     secure: production,
-    sameSite: production ? 'none' : 'lax',
+    sameSite: 'lax',
     path: '/api/cms',
   })
 }

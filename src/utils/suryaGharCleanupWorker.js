@@ -59,7 +59,7 @@ async function processNextJob() {
       $set: { status: 'PROCESSING', lockedUntil: new Date(now.getTime() + LEASE_MS) },
       $inc: { attempts: 1 },
     },
-    { new: true, sort: { nextAttemptAt: 1, createdAt: 1 } },
+    { returnDocument: 'after', sort: { nextAttemptAt: 1, createdAt: 1 } },
   )
   if (!job) return false
 
@@ -86,6 +86,16 @@ async function processNextJob() {
           lockedUntil: null,
           lastError: 'The asset is no longer referenced by this record; no Cloudinary deletion was attempted.',
         },
+        $unset: { publicId: '' },
+      },
+    )
+    return true
+  }
+  if (!path.startsWith('temporaryDocuments.')) {
+    await DocumentCleanupJob.updateOne(
+      { _id: job._id, status: 'PROCESSING' },
+      {
+        $set: { status: 'COMPLETED', completedAt: new Date(), lockedUntil: null, lastError: null },
         $unset: { publicId: '' },
       },
     )

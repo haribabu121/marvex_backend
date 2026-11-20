@@ -1,4 +1,5 @@
 import { getCloudinary } from '../config/cloudinary.js'
+import HttpError from './HttpError.js'
 
 export const SURYA_GHAR_FOLDER = 'marvex-energy/surya-ghar'
 export const documentConfig = {
@@ -35,19 +36,30 @@ export async function verifySuryaGharDocument({ publicId, employeeId, documentTy
   const folder = config.folder(String(employeeId))
   const resource = await getCloudinary().api.resource(publicId, { resource_type: resourceType })
   const resourceFolder = resource.asset_folder || resource.folder || ''
-  const allowedFolder = resourceFolder === folder || resourceFolder.startsWith(`${folder}/`)
-  const format = String(resource.format || '').toLowerCase()
+  const cloudinaryFormat = String(resource.format || '').toLowerCase()
+  const extensionStart = typeof resource.public_id === 'string' ? resource.public_id.lastIndexOf('.') : -1
+  const lastFolderSeparator = typeof resource.public_id === 'string' ? resource.public_id.lastIndexOf('/') : -1
+  const publicIdFormat = extensionStart > lastFolderSeparator
+    ? resource.public_id.slice(extensionStart + 1).toLowerCase()
+    : ''
+  const format = cloudinaryFormat || (resourceType === 'raw' ? publicIdFormat : '')
+  const validationFailures = []
 
-  if (
-    resource.resource_type !== resourceType ||
-    !allowedFolder ||
-    !config.formats.split(',').includes(format) ||
-    !resource.secure_url ||
-    !Number.isInteger(resource.bytes) ||
-    resource.bytes < 1 ||
-    resource.bytes > config.maxBytes
-  ) {
-    throw new Error('Uploaded document failed validation.')
+  if (resource.resource_type !== resourceType) validationFailures.push('resourceType')
+  if (resourceFolder !== folder && !resourceFolder.startsWith(`${folder}/`)) validationFailures.push('folder')
+  if (!config.formats.split(',').includes(format)) validationFailures.push('format')
+  if (!resource.secure_url) validationFailures.push('secureUrl')
+  if (!Number.isInteger(resource.bytes) || resource.bytes < 1) validationFailures.push('byteCount')
+  else if (resource.bytes > config.maxBytes) validationFailures.push('fileSize')
+
+  if (validationFailures.length) {
+    console.warn('Surya Ghar uploaded document failed validation:', {
+      documentType,
+      cloudinaryFormat,
+      publicIdFormat,
+      failedChecks: validationFailures,
+    })
+    throw new HttpError(422, 'Uploaded document failed validation. Please check the file type and size and try again.')
   }
 
   return {

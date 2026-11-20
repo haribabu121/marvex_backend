@@ -11,8 +11,9 @@ import { getCloudinary, isCloudinaryConfigured } from '../config/cloudinary.js'
 import { requireAdmin, requireChangedPassword } from '../middleware/auth.js'
 import { requireEmployee } from '../middleware/employeeAuth.js'
 import { asyncHandler } from '../utils/asyncHandler.js'
+import HttpError from '../utils/HttpError.js'
 import { getAuthorizedEmployeeIds, getEmployeeHierarchy, serializeHierarchyFields } from '../utils/employeeHierarchy.js'
-import { documentConfig, verifySuryaGharDocument, cloudinaryResourceType } from '../utils/suryaGharDocuments.js'
+import { documentConfig, verifySuryaGharDocument, cloudinaryResourceType, SURYA_GHAR_FOLDER } from '../utils/suryaGharDocuments.js'
 import { getSuryaGharReportingPeriod } from '../utils/suryaGharReporting.js'
 
 const router = Router()
@@ -49,6 +50,13 @@ const reviewSchema = z.object({
   status: z.enum(['APPROVED', 'REJECTED', 'RESUBMISSION_REQUIRED']),
   remarks: z.string().max(2000).optional().default(''),
 })
+const previewMaxBytes = 15 * 1024 * 1024
+const previewImageTypes = {
+  jpg: 'image/jpeg',
+  jpeg: 'image/jpeg',
+  png: 'image/png',
+  webp: 'image/webp',
+}
 
 function referenceId(prefix) {
   return `${prefix}-${Date.now().toString(36).toUpperCase()}-${randomUUID().replace(/-/g, '').slice(0, 8).toUpperCase()}`
@@ -121,18 +129,148 @@ async function queueCleanup(recordType, recordId, documents) {
 }
 
 function loginCleanupDocuments(record) {
-  const docs = [
-    { key: 'eTokenProof', document: record.documents?.eTokenProof },
-    { key: 'applicationAcknowledgement', document: record.documents?.applicationAcknowledgement },
-  ]
-  record.temporaryDocuments.forEach((document, index) => docs.push({ key: `temporaryDocuments.${index}`, document }))
-  return docs
+  return (record.temporaryDocuments || []).map((document, index) => ({
+    key: `temporaryDocuments.${index}`,
+    document,
+  }))
 }
 
 function sanctionCleanupDocuments(record) {
-  const docs = [{ key: 'feasibilityApprovalDocument', document: record.feasibilityApprovalDocument }]
-  record.temporaryDocuments.forEach((document, index) => docs.push({ key: `temporaryDocuments.${index}`, document }))
-  return docs
+  return (record.temporaryDocuments || []).map((document, index) => ({
+    key: `temporaryDocuments.${index}`,
+    document,
+  }))
+}
+
+async function sendDocumentPreview(res, document) {
+  if (
+    !document?.publicId?.startsWith(`${SURYA_GHAR_FOLDER}/`) ||
+    !['image', 'raw'].includes(document.resourceType)
+  ) {
+    return res.status(404).json({ success: false, message: 'Document preview is unavailable.' })
+  }
+
+  const cloudName = process.env.CLOUDINARY_CLOUD_NAME
+  if (!cloudName) throw new HttpError(503, 'Document storage is not configured.')
+
+  const cloudinary = getCloudinary()
+  const resource = await cloudinary.api.resource(document.publicId, {
+    resource_type: document.resourceType,
+  })
+  if (
+    resource.public_id !== document.publicId ||
+    resource.resource_type !== document.resourceType
+  ) {
+    throw new HttpError(404, 'Document preview is unavailable.')
+  }
+  const extensionStart = document.publicId.lastIndexOf('.')
+  const folderSeparator = document.publicId.lastIndexOf('/')
+  const publicIdFormat = extensionStart > folderSeparator
+    ? document.publicId.slice(extensionStart + 1).toLowerCase()
+    : ''
+  const format = String(resource.format || publicIdFormat).toLowerCase()
+  const allowedFormats = document.resourceType === 'raw'
+    ? ['pdf']
+    : ['jpg', 'jpeg', 'png', 'webp']
+  if (!allowedFormats.includes(format)) {
+    throw new HttpError(415, 'This document format cannot be previewed.')
+  }
+
+  let url
+  try {
+    url = new URL(cloudinary.utils.private_download_url(document.publicId, format, {
+      resource_type: document.resourceType,
+      type: 'upload',
+      expires_at: Math.floor(Date.now() / 1000) + 60,
+      attachment: false,
+    }))
+  } catch {
+    throw new HttpError(502, 'Document preview is unavailable.')
+  }
+  const expectedPath = `/v1_1/${cloudName}/${document.resourceType}/download`
+  if (
+    url.protocol !== 'https:' ||
+    !url.hostname.endsWith('.cloudinary.com') ||
+    url.pathname !== expectedPath
+  ) {
+    throw new HttpError(502, 'Document preview is unavailable.')
+  }
+
+  const upstream = await fetch(url)
+  if (!upstream.ok) {
+    console.error('Surya Ghar document preview delivery failed:', {
+      status: upstream.status,
+      statusText: upstream.statusText,
+    })
+    throw new HttpError(502, 'Could not retrieve the document preview.')
+  }
+  const contentLength = Number(upstream.headers.get('content-length'))
+  if (Number.isFinite(contentLength) && contentLength > previewMaxBytes) {
+    throw new HttpError(413, 'The document preview exceeds the allowed size.')
+  }
+
+  const data = Buffer.from(await upstream.arrayBuffer())
+  if (data.length > previewMaxBytes) throw new HttpError(413, 'The document preview exceeds the allowed size.')
+
+  let previewType
+  let extension
+  if (document.resourceType === 'raw') {
+    if (data.subarray(0, 5).toString('ascii') !== '%PDF-') {
+      throw new HttpError(415, 'This document cannot be previewed as a PDF.')
+    }
+    previewType = 'application/pdf'
+    extension = 'pdf'
+  } else {
+    previewType = previewImageTypes[format]
+    const validImageSignature = format === 'jpg' || format === 'jpeg'
+      ? data.length >= 3 && data[0] === 0xff && data[1] === 0xd8 && data[2] === 0xff
+      : format === 'png'
+        ? data.subarray(0, 8).equals(Buffer.from('89504e470d0a1a0a', 'hex'))
+        : format === 'webp'
+          ? data.toString('ascii', 0, 4) === 'RIFF' && data.toString('ascii', 8, 12) === 'WEBP'
+          : false
+    if (!previewType || !validImageSignature) {
+      throw new HttpError(415, 'This image format cannot be previewed.')
+    }
+    extension = format === 'jpeg' ? 'jpg' : format
+  }
+
+  res.setHeader('Content-Type', previewType)
+  res.setHeader('Content-Disposition', `inline; filename="document.${extension}"`)
+  res.setHeader('Content-Length', data.length)
+  res.setHeader('Cache-Control', 'private, no-store')
+  res.setHeader('X-Content-Type-Options', 'nosniff')
+  return res.send(data)
+}
+
+function previewMetadata(document) {
+  return {
+    available: Boolean(document?.publicId && document?.resourceType),
+    resourceType: document?.resourceType || null,
+  }
+}
+
+function serializeLoginDocuments(record) {
+  const data = typeof record.toObject === 'function' ? record.toObject() : record
+  const submission = { ...data }
+  delete submission.temporaryDocuments
+  return {
+    ...submission,
+    documents: {
+      eTokenProof: previewMetadata(data.documents?.eTokenProof),
+      applicationAcknowledgement: previewMetadata(data.documents?.applicationAcknowledgement),
+    },
+  }
+}
+
+function serializeSanctionDocument(record) {
+  const data = typeof record.toObject === 'function' ? record.toObject() : record
+  const submission = { ...data }
+  delete submission.temporaryDocuments
+  return {
+    ...submission,
+    feasibilityApprovalDocument: previewMetadata(data.feasibilityApprovalDocument),
+  }
 }
 
 async function setReviewStatus(Model, req, recordId, statusField, verifiedByField, verifiedAtField, recordType) {
@@ -167,7 +305,7 @@ async function setReviewStatus(Model, req, recordId, statusField, verifiedByFiel
     },
     $push: { approvalHistory: { status, adminId: req.admin._id, remarks, changedAt: now } },
   }
-  const updated = await Model.findOneAndUpdate(filter, update, { new: true, runValidators: true })
+  const updated = await Model.findOneAndUpdate(filter, update, { returnDocument: 'after', runValidators: true })
   if (!updated) return { response: { status: 409, message: 'This submission has already been reviewed.' } }
 
   try {
@@ -233,7 +371,10 @@ router.post('/upload/complete', requireEmployee, asyncHandler(async (req, res) =
     documentType: parsed.data.documentType,
     resourceType: parsed.data.resourceType,
   })
-  return res.json({ success: true, data: document })
+  return res.json({
+    success: true,
+    data: { publicId: document.publicId, resourceType: document.resourceType },
+  })
 }))
 
 router.post('/logins', requireEmployee, asyncHandler(async (req, res) => {
@@ -263,7 +404,7 @@ router.post('/logins', requireEmployee, asyncHandler(async (req, res) => {
     ...serializeHierarchyFields(hierarchy),
     loginStatus: 'PENDING',
   })
-  return res.status(201).json({ success: true, data: record })
+  return res.status(201).json({ success: true, data: serializeLoginDocuments(record) })
 }))
 
 router.patch('/logins/:id/resubmit', requireEmployee, asyncHandler(async (req, res) => {
@@ -311,10 +452,10 @@ router.patch('/logins/:id/resubmit', requireEmployee, asyncHandler(async (req, r
   const record = await SuryaGharLogin.findOneAndUpdate(
     { _id: current._id, employeeId: req.employee._id, loginStatus: 'RESUBMISSION_REQUIRED' },
     update,
-    { new: true, runValidators: true },
+    { returnDocument: 'after', runValidators: true },
   )
   if (!record) return res.status(409).json({ success: false, message: 'This login has already been updated.' })
-  return res.json({ success: true, data: record })
+  return res.json({ success: true, data: serializeLoginDocuments(record) })
 }))
 
 router.get('/logins/eligible-for-sanction', requireEmployee, asyncHandler(async (req, res) => {
@@ -393,7 +534,7 @@ router.post('/sanctions', requireEmployee, asyncHandler(async (req, res) => {
       zmId: submitterHierarchy.zmId,
     },
   })
-  return res.status(201).json({ success: true, data: record })
+  return res.status(201).json({ success: true, data: serializeSanctionDocument(record) })
 }))
 
 router.patch('/sanctions/:id/resubmit', requireEmployee, asyncHandler(async (req, res) => {
@@ -441,10 +582,10 @@ router.patch('/sanctions/:id/resubmit', requireEmployee, asyncHandler(async (req
   const record = await SuryaGharSanction.findOneAndUpdate(
     { _id: current._id, submittedByEmployeeId: req.employee._id, sanctionStatus: 'RESUBMISSION_REQUIRED' },
     update,
-    { new: true, runValidators: true },
+    { returnDocument: 'after', runValidators: true },
   )
   if (!record) return res.status(409).json({ success: false, message: 'This sanction has already been updated.' })
-  return res.json({ success: true, data: record })
+  return res.json({ success: true, data: serializeSanctionDocument(record) })
 }))
 
 router.get('/dashboard', requireEmployee, asyncHandler(async (req, res) => {
@@ -538,7 +679,7 @@ router.get('/logins', requireEmployee, asyncHandler(async (req, res) => {
     SuryaGharLogin.find(filter).sort({ createdAt: -1 }).skip((page - 1) * limit).limit(limit).lean(),
     SuryaGharLogin.countDocuments(filter),
   ])
-  return res.json({ success: true, data: { items, total, page, limit } })
+  return res.json({ success: true, data: { items: items.map(serializeLoginDocuments), total, page, limit } })
 }))
 
 router.get('/sanctions', requireEmployee, asyncHandler(async (req, res) => {
@@ -554,7 +695,35 @@ router.get('/sanctions', requireEmployee, asyncHandler(async (req, res) => {
     SuryaGharSanction.find(filter).sort({ createdAt: -1 }).skip((page - 1) * limit).limit(limit).lean(),
     SuryaGharSanction.countDocuments(filter),
   ])
-  return res.json({ success: true, data: { items, total, page, limit } })
+  return res.json({ success: true, data: { items: items.map(serializeSanctionDocument), total, page, limit } })
+}))
+
+router.get('/logins/:id/documents/:documentKey/preview', requireEmployee, asyncHandler(async (req, res) => {
+  if (!mongoose.isValidObjectId(req.params.id)) return res.status(400).json({ success: false, message: 'Invalid login submission ID.' })
+  if (!['eTokenProof', 'applicationAcknowledgement'].includes(req.params.documentKey)) {
+    return res.status(404).json({ success: false, message: 'Document preview is unavailable.' })
+  }
+  const employeeIds = await getAuthorizedEmployeeIds(req.employee)
+  const record = await SuryaGharLogin.findOne({
+    _id: req.params.id,
+    employeeId: { $in: employeeIds },
+  }).select('documents').lean()
+  if (!record) return res.status(404).json({ success: false, message: 'Submission not found.' })
+  return sendDocumentPreview(res, record.documents?.[req.params.documentKey])
+}))
+
+router.get('/sanctions/:id/documents/feasibilityApprovalDocument/preview', requireEmployee, asyncHandler(async (req, res) => {
+  if (!mongoose.isValidObjectId(req.params.id)) return res.status(400).json({ success: false, message: 'Invalid sanction submission ID.' })
+  const employeeIds = await getAuthorizedEmployeeIds(req.employee)
+  const record = await SuryaGharSanction.findOne({
+    _id: req.params.id,
+    $or: [
+      { employeeId: { $in: employeeIds } },
+      { submittedByEmployeeId: { $in: employeeIds } },
+    ],
+  }).select('feasibilityApprovalDocument').lean()
+  if (!record) return res.status(404).json({ success: false, message: 'Submission not found.' })
+  return sendDocumentPreview(res, record.feasibilityApprovalDocument)
 }))
 
 router.get('/admin/logins', requireAdmin, requireChangedPassword, asyncHandler(async (req, res) => {
@@ -566,7 +735,7 @@ router.get('/admin/logins', requireAdmin, requireChangedPassword, asyncHandler(a
     SuryaGharLogin.find(filter).populate('employeeId', 'name role').sort({ createdAt: -1 }).skip((page - 1) * limit).limit(limit).lean(),
     SuryaGharLogin.countDocuments(filter),
   ])
-  return res.json({ success: true, data: { items, total, page, limit } })
+  return res.json({ success: true, data: { items: items.map(serializeLoginDocuments), total, page, limit } })
 }))
 
 router.get('/admin/sanctions', requireAdmin, requireChangedPassword, asyncHandler(async (req, res) => {
@@ -578,7 +747,7 @@ router.get('/admin/sanctions', requireAdmin, requireChangedPassword, asyncHandle
     SuryaGharSanction.find(filter).populate('submittedByEmployeeId', 'name role').sort({ createdAt: -1 }).skip((page - 1) * limit).limit(limit).lean(),
     SuryaGharSanction.countDocuments(filter),
   ])
-  return res.json({ success: true, data: { items, total, page, limit } })
+  return res.json({ success: true, data: { items: items.map(serializeSanctionDocument), total, page, limit } })
 }))
 
 router.get('/admin/cleanup-jobs', requireAdmin, requireChangedPassword, asyncHandler(async (_req, res) => {
@@ -590,18 +759,35 @@ router.get('/admin/cleanup-jobs', requireAdmin, requireChangedPassword, asyncHan
   return res.json({ success: true, data: { items } })
 }))
 
+router.get('/admin/logins/:id/documents/:documentKey/preview', requireAdmin, requireChangedPassword, asyncHandler(async (req, res) => {
+  if (!mongoose.isValidObjectId(req.params.id)) return res.status(400).json({ success: false, message: 'Invalid login submission ID.' })
+  if (!['eTokenProof', 'applicationAcknowledgement'].includes(req.params.documentKey)) {
+    return res.status(404).json({ success: false, message: 'Document preview is unavailable.' })
+  }
+  const record = await SuryaGharLogin.findById(req.params.id).lean()
+  if (!record) return res.status(404).json({ success: false, message: 'Submission not found.' })
+  return sendDocumentPreview(res, record.documents?.[req.params.documentKey])
+}))
+
+router.get('/admin/sanctions/:id/documents/feasibilityApprovalDocument/preview', requireAdmin, requireChangedPassword, asyncHandler(async (req, res) => {
+  if (!mongoose.isValidObjectId(req.params.id)) return res.status(400).json({ success: false, message: 'Invalid sanction submission ID.' })
+  const record = await SuryaGharSanction.findById(req.params.id).lean()
+  if (!record) return res.status(404).json({ success: false, message: 'Submission not found.' })
+  return sendDocumentPreview(res, record.feasibilityApprovalDocument)
+}))
+
 router.patch('/admin/logins/:id/review', requireAdmin, requireChangedPassword, asyncHandler(async (req, res) => {
   if (!mongoose.isValidObjectId(req.params.id)) return res.status(400).json({ success: false, message: 'Invalid login submission ID.' })
   const result = await setReviewStatus(SuryaGharLogin, req, req.params.id, 'loginStatus', 'loginVerifiedBy', 'loginVerifiedAt', 'login')
   if (result.response) return res.status(result.response.status).json({ success: false, message: result.response.message })
-  return res.json({ success: true, data: result.record })
+  return res.json({ success: true, data: serializeLoginDocuments(result.record) })
 }))
 
 router.patch('/admin/sanctions/:id/review', requireAdmin, requireChangedPassword, asyncHandler(async (req, res) => {
   if (!mongoose.isValidObjectId(req.params.id)) return res.status(400).json({ success: false, message: 'Invalid sanction submission ID.' })
   const result = await setReviewStatus(SuryaGharSanction, req, req.params.id, 'sanctionStatus', 'verifiedBy', 'sanctionVerifiedAt', 'sanction')
   if (result.response) return res.status(result.response.status).json({ success: false, message: result.response.message })
-  return res.json({ success: true, data: result.record })
+  return res.json({ success: true, data: serializeSanctionDocument(result.record) })
 }))
 
 export default router

@@ -127,7 +127,7 @@ router.post('/upload/complete', requireAdmin, requireChangedPassword, asyncHandl
         uploadedBy: req.admin._id,
       },
     },
-    { upsert: true, new: true, runValidators: true, setDefaultsOnInsert: true },
+    { upsert: true, returnDocument: 'after', runValidators: true, setDefaultsOnInsert: true },
   )
 
   await writeAuditLog(req, 'media.uploaded', `Uploaded ${parsed.data.assetType} media.`, 'media', mediaAsset._id)

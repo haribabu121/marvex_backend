@@ -74,7 +74,7 @@ router.patch('/:id/active', requireAdmin, requireChangedPassword, asyncHandler(a
   const employee = await Employee.findByIdAndUpdate(
     req.params.id,
     { $set: { isActive: parsed.data.isActive }, $inc: { tokenVersion: 1 } },
-    { new: true, runValidators: true },
+    { returnDocument: 'after', runValidators: true },
   ).select('name email role isActive')
   if (!employee) throw new HttpError(404, 'Employee not found.')
   await writeAuditLog(
